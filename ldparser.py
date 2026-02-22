@@ -360,11 +360,13 @@ class ldChan(object):
             dtype = safe_get([None, np.float16, None, np.float32], dtype - 1)
         elif dtype_a in [0, 0x03, 0x05]:
             dtype = safe_get([None, np.int16, None, np.int32], dtype - 1)
+        elif dtype_a == 0x08 and dtype == 0x08:
+            dtype = np.dtype('<d')
         else:
             dtype = None
 
         return cls(_f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
-                   dtype, freq, shift, mul, scale, dec,name, short_name, unit)
+                   dtype, freq, shift, mul, scale, dec, name, short_name, unit)
 
     def write(self, f, n):
         if self.dtype == np.float16 or self.dtype == np.float32:
