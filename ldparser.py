@@ -314,7 +314,8 @@ class ldChan(object):
         "HHH"     # datatype datatype rec_freq
         "hhhh"    # shift mul scale unknown
         "32s"     # channel id/name
-        "16s"     # unit
+        "8s"      # display unit
+        "8s"      # unknown
         "12s"     # unknown
         "f"       # display mode minimum
         "f"       # display mode maximum
@@ -358,11 +359,10 @@ class ldChan(object):
 
             (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
              dtype_a, dtype, freq, shift, mul, scale, unknown,
-             name, unit, unit_tail, display_min, display_max, dec, sample_mode, display_format) = \
+             name, unit, short_name, unit_tail, display_min, display_max, dec, sample_mode, display_format) = \
                 struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
 
-        name, unit = map(decode_string, [name, unit])
-        short_name = ""
+        name, short_name, unit = map(decode_string, [name, short_name, unit])
 
         if dtype_a in [0x07]:
             dtype = [None, np.float16, None, np.float32][dtype-1]
@@ -386,7 +386,7 @@ class ldChan(object):
         f.write(struct.pack(ldChan.fmt,
                             self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
                             0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.unknown,
-                            self.name.encode(), self.unit.encode(), self.unit_tail,
+                            self.name.encode(), self.unit.encode(), self.short_name.encode(), self.unit_tail,
                             self.display_min, self.display_max, min(int(self.dec), 0x30),
                             self.sample_mode, self.display_format))
 
