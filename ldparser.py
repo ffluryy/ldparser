@@ -314,10 +314,10 @@ class ldChan(object):
         "HHH"     # datatype datatype rec_freq
         "hhhh"    # shift mul scale unknown
         "32s"     # channel id/name
-        "8s"      # short name / unknown
-        "8s"      # unit
-        "16s"     # unit trailing bytes / unknown display settings
-        "I"       # unknown
+        "16s"     # unit
+        "12s"     # unknown
+        "f"       # display mode minimum
+        "f"       # display mode maximum
         "B"       # decimal places
         "B"       # sampling mode
         "B"       # display format
@@ -327,7 +327,7 @@ class ldChan(object):
     def __init__(self, _f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                  dtype, freq, shift, mul, scale, dec,
                  name, short_name, unit, unknown=0, metadata_unknown=0, sample_mode=3,
-                 display_format=0, unit_tail=None):
+                 display_format=0, unit_tail=None, display_min=0.0, display_max=0.0):
 
         self._f = _f
         self.meta_ptr = meta_ptr
@@ -339,12 +339,14 @@ class ldChan(object):
         (self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
         self.dtype, self.freq,
         self.shift, self.mul, self.scale, self.unknown, self.dec,
-        self.name, self.short_name, self.unit, self.unit_tail, self.metadata_unknown,
-        self.sample_mode, self.display_format) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
+        self.name, self.short_name, self.unit, self.unit_tail, self.display_min,
+        self.display_max, self.metadata_unknown, self.sample_mode,
+        self.display_format) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
                                                  dtype, freq,\
-                                                 shift, mul, scale, unknown, min(int(dec), 15),\
-                                                 name, short_name, unit, unit_tail, metadata_unknown,\
-                                                 sample_mode, display_format
+                                                 shift, mul, scale, unknown, min(int(dec), 0x30),\
+                                                 name, short_name, unit, unit_tail, display_min,\
+                                                 display_max, metadata_unknown, sample_mode,\
+                                                 display_format
 
     @classmethod
     def fromfile(cls, _f, meta_ptr):
@@ -356,10 +358,11 @@ class ldChan(object):
 
             (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
              dtype_a, dtype, freq, shift, mul, scale, unknown,
-             name, short_name, unit, unit_tail, metadata_unknown, dec, sample_mode, display_format) = \
+             name, unit, unit_tail, display_min, display_max, dec, sample_mode, display_format) = \
                 struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
 
-        name, short_name, unit = map(decode_string, [name, short_name, unit])
+        name, unit = map(decode_string, [name, unit])
+        short_name = ""
 
         if dtype_a in [0x07]:
             dtype = [None, np.float16, None, np.float32][dtype-1]
@@ -369,7 +372,8 @@ class ldChan(object):
 
         return cls(_f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                    dtype, freq, shift, mul, scale, dec, name, short_name, unit,
-                   unknown, metadata_unknown, sample_mode, display_format, unit_tail)
+                   unknown, 0, sample_mode, display_format, unit_tail,
+                   display_min, display_max)
 
     def write(self, f, n):
         if self.dtype == np.float16 or self.dtype == np.float32:
@@ -382,8 +386,9 @@ class ldChan(object):
         f.write(struct.pack(ldChan.fmt,
                             self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
                             0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.unknown,
-                            self.name.encode(), self.short_name.encode(), self.unit.encode(), self.unit_tail,
-                            self.metadata_unknown, min(int(self.dec), 15), self.sample_mode, self.display_format))
+                            self.name.encode(), self.unit.encode(), self.unit_tail,
+                            self.display_min, self.display_max, min(int(self.dec), 0x30),
+                            self.sample_mode, self.display_format))
 
     def write_data(self):
         return np.asarray(self.data, dtype=self.dtype).tobytes()
