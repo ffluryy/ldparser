@@ -322,13 +322,17 @@ class ldChan(object):
         "B"       # decimal places
         "B"       # sampling mode
         "B"       # display format
-        "21x"     # padding
+        "13x"     # padding
+        "II"      # channel metadata pointer, optional extra metadata pointer
     )
+    fixed_size = struct.calcsize(fmt)
+    default_metadata_size = 56
 
     def __init__(self, _f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                  dtype, freq, shift, mul, scale, dec,
                  name, short_name, unit, unknown=0, metadata_unknown=0, sample_mode=3,
-                 display_format=0, unit_tail=None, display_min=0.0, display_max=0.0):
+                 display_format=0, unit_tail=None, display_min=0.0, display_max=0.0,
+                 channel_metadata=None, extra_metadata=None):
 
         self._f = _f
         self.meta_ptr = meta_ptr
@@ -336,21 +340,24 @@ class ldChan(object):
 
         if unit_tail is None:
             unit_tail = b""
+        if extra_metadata is None:
+            extra_metadata = b""
 
         (self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
         self.dtype, self.freq,
         self.shift, self.mul, self.scale, self.unknown, self.dec,
         self.name, self.short_name, self.unit, self.unit_tail, self.display_min,
         self.display_max, self.metadata_unknown, self.sample_mode,
-        self.display_format) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
+        self.display_format, self.channel_metadata,
+        self.extra_metadata) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
                                                  dtype, freq,\
                                                  shift, mul, scale, unknown, min(int(dec), 0x30),\
                                                  name, short_name, unit, unit_tail, display_min,\
                                                  display_max, metadata_unknown, sample_mode,\
-                                                 display_format
+                                                 display_format, channel_metadata, extra_metadata
 
     @classmethod
-    def fromfile(cls, _f, meta_ptr):
+    def fromfile(cls, _f, meta_ptr, metadata_end=None):
         # type: (str, int) -> ldChan
         """Parses and stores the header information of an ld channel in a ld file
         """
@@ -359,13 +366,28 @@ class ldChan(object):
 
             (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
              dtype_a, dtype, freq, shift, mul, scale, unknown,
-             name, unit, short_name, unit_tail, display_min, display_max, dec, sample_mode, display_format) = \
+             name, unit, short_name, unit_tail, display_min, display_max, dec, sample_mode, display_format,
+             channel_metadata_ptr, extra_metadata_ptr) = \
                 struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
+
+            end_ptr = next_meta_ptr if next_meta_ptr else metadata_end
+            channel_metadata = None
+            extra_metadata = b""
+            if channel_metadata_ptr:
+                channel_metadata_end = extra_metadata_ptr if extra_metadata_ptr else end_ptr
+                if channel_metadata_end and channel_metadata_end >= channel_metadata_ptr:
+                    f.seek(channel_metadata_ptr)
+                    channel_metadata = f.read(channel_metadata_end - channel_metadata_ptr)
+            if extra_metadata_ptr and end_ptr and end_ptr >= extra_metadata_ptr:
+                f.seek(extra_metadata_ptr)
+                extra_metadata = f.read(end_ptr - extra_metadata_ptr)
 
         name, short_name, unit = map(decode_string, [name, short_name, unit])
 
         if dtype_a in [0x07]:
             dtype = [None, np.float16, None, np.float32][dtype-1]
+        elif dtype_a == 0x06:
+            dtype = np.int32
         elif dtype_a in [0, 0x03, 0x05]:
             dtype = [None, np.int16, None, np.int32][dtype-1]
         else: raise Exception('Datatype %i not recognized'%dtype_a)
@@ -373,7 +395,19 @@ class ldChan(object):
         return cls(_f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                    dtype, freq, shift, mul, scale, dec, name, short_name, unit,
                    unknown, 0, sample_mode, display_format, unit_tail,
-                   display_min, display_max)
+                   display_min, display_max, channel_metadata, extra_metadata)
+
+    def metadata_size(self):
+        return self.fixed_size + len(self.get_channel_metadata()) + len(self.extra_metadata)
+
+    def get_channel_metadata(self):
+        if self.channel_metadata is not None:
+            return self.channel_metadata
+
+        metadata_ptr = self.meta_ptr + self.fixed_size
+        pointer_value = metadata_ptr + 44
+        rate_hint = max(1, int(round(self.freq * 5.0 / 6.0)))
+        return struct.pack("<HHII36xHHI", 0, self.freq, 2, pointer_value, 1, rate_hint, 0)
 
     def write(self, f, n):
         if self.dtype == np.float16 or self.dtype == np.float32:
@@ -383,12 +417,18 @@ class ldChan(object):
             dtype_a = 0x03
             dtype = {np.int16: 2, np.int32: 4}[self.dtype]
 
+        channel_metadata = self.get_channel_metadata()
+        channel_metadata_ptr = self.meta_ptr + self.fixed_size if channel_metadata else 0
+        extra_metadata_ptr = channel_metadata_ptr + len(channel_metadata) if self.extra_metadata else 0
+
         f.write(struct.pack(ldChan.fmt,
                             self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
                             0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.unknown,
                             self.name.encode(), self.unit.encode(), self.short_name.encode(), self.unit_tail,
                             self.display_min, self.display_max, min(int(self.dec), 0x30),
-                            self.sample_mode, self.display_format))
+                            self.sample_mode, self.display_format, channel_metadata_ptr, extra_metadata_ptr))
+        f.write(channel_metadata)
+        f.write(self.extra_metadata)
 
     def write_data(self):
         return np.asarray(self.data, dtype=self.dtype).tobytes()
@@ -434,7 +474,7 @@ def decode_string(bytes):
         return ""
         # raise e
 
-def read_channels(f_, meta_ptr):
+def read_channels(f_, meta_ptr, metadata_end=None):
     # type: (str, int) -> list
     """ Read channel data inside ld file
 
@@ -444,7 +484,7 @@ def read_channels(f_, meta_ptr):
     """
     chans = []
     while meta_ptr:
-        chan_ = ldChan.fromfile(f_, meta_ptr)
+        chan_ = ldChan.fromfile(f_, meta_ptr, metadata_end)
         chans.append(chan_)
         meta_ptr = chan_.next_meta_ptr
     return chans
@@ -455,7 +495,7 @@ def read_ldfile(f_):
     """ Read an ld file, return header and list of channels
     """
     head_ = ldHead.fromfile(open(f_,'rb'))
-    chans = read_channels(f_, head_.meta_ptr)
+    chans = read_channels(f_, head_.meta_ptr, head_.data_ptr)
     return head_, chans
 
 
