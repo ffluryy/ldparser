@@ -275,16 +275,19 @@ class ldHead(object):
         return cls(meta_ptr, data_ptr, aux_ptr, aux, driver, vehicleid, venue, _datetime, short_comment, event, session)
 
     def write(self, f, n):
+        channel_counts = (n << 16) | n
         f.write(struct.pack(ldHead.fmt,
                             0x40,
                             self.meta_ptr, self.data_ptr, self.aux_ptr,
-                            1, 0x4240, 0xf,
-                            0x1f44, "ADL".encode(), 420, 0xadb0, n,
+                            2, 0x4240, 0xf,
+                            0x8540, "M1".encode(), 100, 0x80, channel_counts,
                             self.datetime.date().strftime("%d/%m/%Y").encode(),
                             self.datetime.time().strftime("%H:%M:%S").encode(),
                             self.driver.encode(), self.vehicleid.encode(), self.venue.encode(),
-                            0xc81a4, self.short_comment.encode(), self.event.encode(), self.session.encode(),
+                            0x06344004, self.short_comment.encode(), self.event.encode(), self.session.encode(),
                             ))
+        f.seek(0x5a)
+        f.write(struct.pack("<HH", 200, 1))
         if self.aux_ptr > 0:
             f.seek(self.aux_ptr)
             self.aux.write(f)
