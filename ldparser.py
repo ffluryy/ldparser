@@ -112,14 +112,11 @@ class ldData(object):
         """Write an ld file containing the current header information and channel data
         """
 
-        # convert the data using scale/shift etc before writing the data
-        conv_data = lambda c: ((c.data / c.mul) - c.shift) * c.scale / pow(10., -c.dec)
-
         with open(f, 'wb') as f_:
             self.head.write(f_, len(self.channs))
             f_.seek(self.channs[0].meta_ptr)
             list(map(lambda c: c[1].write(f_, c[0]), enumerate(self.channs)))
-            list(map(lambda c: f_.write(conv_data(c)), self.channs))
+            list(map(lambda c: f_.write(c.write_data()), self.channs))
 
 
 class ldEvent(object):
@@ -315,16 +312,20 @@ class ldChan(object):
         "IIII"    # prev_addr next_addr data_ptr n_data
         "H"       # some counter?
         "HHH"     # datatype datatype rec_freq
-        "HHHh"    # shift mul scale dec_places
-        "32s"     # name
-        "8s"      # short name
-        "12s"     # unit
-        "40x"     # ? (40 bytes for ACC, 32 bytes for acti)
+        "hhhh"    # shift mul scale unknown
+        "32s"     # channel id/name
+        "32s"     # unit
+        "I"       # unknown
+        "B"       # decimal places
+        "B"       # sampling mode
+        "B"       # display format
+        "21x"     # padding
     )
 
     def __init__(self, _f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                  dtype, freq, shift, mul, scale, dec,
-                 name, short_name, unit):
+                 name, short_name, unit, unknown=0, metadata_unknown=0, sample_mode=3,
+                 display_format=0):
 
         self._f = _f
         self.meta_ptr = meta_ptr
@@ -332,11 +333,13 @@ class ldChan(object):
 
         (self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
         self.dtype, self.freq,
-        self.shift, self.mul, self.scale, self.dec,
-        self.name, self.short_name, self.unit) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
+        self.shift, self.mul, self.scale, self.unknown, self.dec,
+        self.name, self.short_name, self.unit, self.metadata_unknown, self.sample_mode,
+        self.display_format) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
                                                  dtype, freq,\
-                                                 shift, mul, scale, dec,\
-                                                 name, short_name, unit
+                                                 shift, mul, scale, unknown, min(int(dec), 15),\
+                                                 name, short_name, unit, metadata_unknown,\
+                                                 sample_mode, display_format
 
     @classmethod
     def fromfile(cls, _f, meta_ptr):
@@ -347,10 +350,12 @@ class ldChan(object):
             f.seek(meta_ptr)
 
             (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
-             dtype_a, dtype, freq, shift, mul, scale, dec,
-             name, short_name, unit) = struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
+             dtype_a, dtype, freq, shift, mul, scale, unknown,
+             name, unit, metadata_unknown, dec, sample_mode, display_format) = \
+                struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
 
-        name, short_name, unit = map(decode_string, [name, short_name, unit])
+        name, unit = map(decode_string, [name, unit])
+        short_name = ""
 
         if dtype_a in [0x07]:
             dtype = [None, np.float16, None, np.float32][dtype-1]
@@ -359,7 +364,8 @@ class ldChan(object):
         else: raise Exception('Datatype %i not recognized'%dtype_a)
 
         return cls(_f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
-                   dtype, freq, shift, mul, scale, dec,name, short_name, unit)
+                   dtype, freq, shift, mul, scale, dec, name, short_name, unit,
+                   unknown, metadata_unknown, sample_mode, display_format)
 
     def write(self, f, n):
         if self.dtype == np.float16 or self.dtype == np.float32:
@@ -371,8 +377,12 @@ class ldChan(object):
 
         f.write(struct.pack(ldChan.fmt,
                             self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
-                            0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.dec,
-                            self.name.encode(), self.short_name.encode(), self.unit.encode()))
+                            0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.unknown,
+                            self.name.encode(), self.unit.encode(), self.metadata_unknown, min(int(self.dec), 15),
+                            self.sample_mode, self.display_format))
+
+    def write_data(self):
+        return np.asarray(self.data, dtype=self.dtype).tobytes()
 
     @property
     def data(self):
@@ -386,8 +396,6 @@ class ldChan(object):
                 try:
                     self._data = np.fromfile(f,
                                             count=self.data_len, dtype=self.dtype)
-
-                    self._data = (self._data/self.scale * pow(10., -self.dec) + self.shift) * self.mul
 
                     if len(self._data) != self.data_len:
                         raise ValueError("Not all data read!")
