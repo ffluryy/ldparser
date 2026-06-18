@@ -327,6 +327,41 @@ class ldChan(object):
     )
     fixed_size = struct.calcsize(fmt)
     default_metadata_size = 56
+    # Display-unit bytes observed in exports/S1_#34112_20260403_142112_06.ld.
+    # MoTeC i2 uses this 8-byte text field to bind a channel to its global
+    # Data Properties quantity. Unitless channels use a null display-unit field.
+    display_unit_lookup = {
+        "": "0000000000000000",
+        "%": "2500000000000000",
+        "A": "4100000000000000",
+        "A.h": "412e680000000000",
+        "C": "4300000000000000",
+        "G": "4700000000000000",
+        "Hz": "487a000000000000",
+        "N": "4e00000000000000",
+        "Pa": "5061000000000000",
+        "V": "5600000000000000",
+        "deg": "6465670000000000",
+        "deg/s": "6465672f73000000",
+        "kPa": "6b50610000000000",
+        "km": "6b6d000000000000",
+        "km/h": "6b6d2f6800000000",
+        "m": "6d00000000000000",
+        "m/s": "6d2f730000000000",
+        "m/s/s": "6d2f732f73000000",
+        "mbar": "6d62617200000000",
+        "mm": "6d6d000000000000",
+        "ms": "6d73000000000000",
+        "ohm": "6f686d0000000000",
+        "ratio": "726174696f000000",
+        "rpm": "72706d0000000000",
+        "s": "7300000000000000",
+        "us": "7573000000000000",
+    }
+    display_unit_lookup = {
+        unit: bytes.fromhex(value)
+        for unit, value in display_unit_lookup.items()
+    }
 
     def __init__(self, _f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                  dtype, freq, shift, mul, scale, dec,
@@ -409,6 +444,16 @@ class ldChan(object):
         rate_hint = max(1, int(round(self.freq * 5.0 / 6.0)))
         return struct.pack("<HHII36xHHI", 0, self.freq, 2, pointer_value, 1, rate_hint, 0)
 
+    def get_display_unit(self):
+        unit = self.unit
+        if isinstance(unit, bytes):
+            unit = decode_string(unit)
+
+        if unit in self.display_unit_lookup:
+            return self.display_unit_lookup[unit]
+
+        return str(unit).encode()[:8].ljust(8, b"\0")
+
     def write(self, f, n):
         if self.dtype == np.float16 or self.dtype == np.float32:
             dtype_a = 0x07
@@ -420,11 +465,12 @@ class ldChan(object):
         channel_metadata = self.get_channel_metadata()
         channel_metadata_ptr = self.meta_ptr + self.fixed_size if channel_metadata else 0
         extra_metadata_ptr = channel_metadata_ptr + len(channel_metadata) if self.extra_metadata else 0
+        display_unit = self.get_display_unit()
 
         f.write(struct.pack(ldChan.fmt,
                             self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
                             0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.unknown,
-                            self.name.encode(), self.unit.encode(), self.short_name.encode(), self.unit_tail,
+                            self.name.encode(), display_unit, self.short_name.encode(), self.unit_tail,
                             self.display_min, self.display_max, min(int(self.dec), 0x30),
                             self.sample_mode, self.display_format, channel_metadata_ptr, extra_metadata_ptr))
         f.write(channel_metadata)
