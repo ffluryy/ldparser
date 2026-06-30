@@ -4,7 +4,10 @@ Code created through reverse engineering the data format.
 """
 
 import datetime
+import os
 import struct
+import xml.etree.ElementTree as ET
+from decimal import Decimal, ROUND_CEILING
 
 import numpy as np
 
@@ -103,11 +106,15 @@ class ldData(object):
         return cls(head, channs)
 
     @classmethod
-    def fromfile(cls, f):
+    def fromfile(cls, f, laps=None, ldx_file=None):
         # type: (str) -> ldData
         """Parse data of an ld file
+
+        When laps is provided, only data in the selected 1-based inclusive
+        lap range is read. Lap boundaries are loaded from the matching .ldx
+        file by default.
         """
-        return cls(*read_ldfile(f))
+        return cls(*read_ldfile(f, laps=laps, ldx_file=ldx_file))
 
     def write(self, f):
         # type: (str) -> ()
@@ -337,6 +344,26 @@ class ldChan(object):
                                                  shift, mul, scale, dec,\
                                                  name, short_name, unit
 
+    def with_sample_range(self, sample_start, sample_end):
+        # type: (int, int) -> ldChan
+        """Return a channel that reads only the requested sample window."""
+        sample_start = min(max(int(sample_start), 0), self.data_len)
+        sample_end = min(max(int(sample_end), sample_start), self.data_len)
+        data_ptr = self.data_ptr
+
+        if self.dtype is not None:
+            data_ptr += sample_start * np.dtype(self.dtype).itemsize
+
+        chan = ldChan(self._f, self.meta_ptr, self.prev_meta_ptr, self.next_meta_ptr,
+                      data_ptr, sample_end - sample_start, self.dtype, self.freq,
+                      self.shift, self.mul, self.scale, self.dec,
+                      self.name, self.short_name, self.unit)
+
+        if self._data is not None:
+            chan._data = self._data[sample_start:sample_end]
+
+        return chan
+
     @classmethod
     def fromfile(cls, _f, meta_ptr):
         # type: (str, int) -> ldChan
@@ -442,13 +469,115 @@ def read_channels(f_, meta_ptr):
     return chans
 
 
-def read_ldfile(f_):
+def read_ldfile(f_, laps=None, ldx_file=None):
     # type: (str) -> (ldHead, list)
     """ Read an ld file, return header and list of channels
+
+    If laps is provided, the channel data is constrained to the selected
+    1-based inclusive lap range using beacon markers from the .ldx sidecar.
     """
-    head_ = ldHead.fromfile(open(f_,'rb'))
+    with open(f_, 'rb') as f:
+        head_ = ldHead.fromfile(f)
     chans = read_channels(f_, head_.meta_ptr)
+
+    if laps is not None:
+        if ldx_file is None:
+            ldx_file = os.path.splitext(f_)[0] + '.ldx'
+        start_us, end_us = get_lap_time_range(ldx_file, laps)
+        chans = [slice_channel_to_time_range(chan, start_us, end_us) for chan in chans]
+
     return head_, chans
+
+
+def read_ldx_beacons(ldx_file):
+    # type: (str) -> list
+    """Read BCN marker timestamps from an .ldx file in microseconds."""
+    tree = ET.parse(ldx_file)
+    beacons = []
+
+    for marker in tree.iter('Marker'):
+        if marker.get('ClassName') != 'BCN':
+            continue
+
+        time = marker.get('Time')
+        if time is None:
+            continue
+
+        beacons.append(Decimal(time))
+
+    return sorted(beacons)
+
+
+def parse_lap_range(laps):
+    # type: (object) -> (int, int)
+    """Normalize a 1-based inclusive lap range."""
+    if isinstance(laps, int):
+        start_lap, end_lap = laps, laps
+    elif isinstance(laps, str):
+        laps = laps.strip()
+        if '-' in laps:
+            start, end = laps.split('-', 1)
+            start_lap, end_lap = int(start), int(end)
+        elif ':' in laps:
+            start, end = laps.split(':', 1)
+            start_lap, end_lap = int(start), int(end)
+        else:
+            start_lap = end_lap = int(laps)
+    else:
+        start_lap, end_lap = laps
+        start_lap, end_lap = int(start_lap), int(end_lap)
+
+    if start_lap < 1 or end_lap < start_lap:
+        raise ValueError('Lap range must be 1-based and inclusive, e.g. 3 or 3-5')
+
+    return start_lap, end_lap
+
+
+def get_lap_time_range(ldx_file, laps):
+    # type: (str, object) -> (Decimal, Decimal)
+    """Return start/end timestamps in microseconds for a lap range.
+
+    BCN1 marks the end of lap 1, BCN2 the end of lap 2, and so on. If the
+    requested range ends on the final open-ended lap, end_us is None.
+    """
+    start_lap, end_lap = parse_lap_range(laps)
+    beacons = read_ldx_beacons(ldx_file)
+
+    if not beacons:
+        raise ValueError('No BCN markers found in %s' % ldx_file)
+
+    max_lap_with_boundary = len(beacons)
+    max_selectable_lap = max_lap_with_boundary + 1
+
+    if start_lap > max_selectable_lap:
+        raise ValueError(
+            'Lap range starts at lap %i, but %s only has boundaries through lap %i' %
+            (start_lap, ldx_file, max_lap_with_boundary))
+
+    if end_lap > max_selectable_lap:
+        raise ValueError(
+            'Lap range ends at lap %i, but %s only has boundaries through lap %i' %
+            (end_lap, ldx_file, max_lap_with_boundary))
+
+    start_us = Decimal(0) if start_lap == 1 else beacons[start_lap - 2]
+    end_us = beacons[end_lap - 1] if end_lap <= max_lap_with_boundary else None
+
+    return start_us, end_us
+
+
+def time_us_to_sample_index(time_us, freq):
+    # type: (Decimal, int) -> int
+    """Convert a microsecond timestamp to the first sample at or after it."""
+    samples = time_us * Decimal(int(freq)) / Decimal(1000000)
+    return int(samples.to_integral_value(rounding=ROUND_CEILING))
+
+
+def slice_channel_to_time_range(chan, start_us, end_us):
+    # type: (ldChan, Decimal, Decimal) -> ldChan
+    """Constrain a channel to a timestamp window."""
+    sample_start = time_us_to_sample_index(start_us, chan.freq)
+    sample_end = chan.data_len if end_us is None else time_us_to_sample_index(end_us, chan.freq)
+    return chan.with_sample_range(sample_start, sample_end)
 
 
 if __name__ == '__main__':
@@ -458,19 +587,21 @@ if __name__ == '__main__':
     a plot for data with the same sample frequency.  
     """
 
-    import sys, os, glob
+    import argparse, glob
     from itertools import groupby
     import pandas as pd
     import matplotlib.pyplot as plt
 
-    if len(sys.argv)!=2:
-        print("Usage: ldparser.py /some/path/")
-        exit(1)
+    parser = argparse.ArgumentParser(description='Parse MoTec .ld files.')
+    parser.add_argument('path', help='Directory containing .ld files')
+    parser.add_argument('--laps',
+                        help='1-based inclusive lap or lap range to extract, e.g. 3 or 3-5')
+    args = parser.parse_args()
 
-    for f in glob.glob('%s/*.ld'%sys.argv[1]):
+    for f in glob.glob('%s/*.ld'%args.path):
         print(os.path.basename(f))
 
-        l = ldData.fromfile(f)
+        l = ldData.fromfile(f, laps=args.laps)
         print(l.head)
         print(list(map(str, l)))
         print()
