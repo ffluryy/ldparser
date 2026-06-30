@@ -63,22 +63,20 @@ class ldData(object):
         freq, dtype = 10, np.float32
 
         # pointer to meta data of first channel
-        meta_ptr = struct.calcsize(ldHead.fmt) + struct.calcsize(ldEvent.fmt)
+        meta_ptr = struct.calcsize(ldHead.fmt)
 
         # list of columns to read - only accept numeric data
         cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
 
         # pointer to data of first channel
-        chanheadsize = struct.calcsize(ldChan.fmt)
+        chanheadsize = ldChan.fixed_size + ldChan.default_metadata_size
         data_ptr = meta_ptr + len(cols) * chanheadsize
-        event_ptr = struct.calcsize(ldHead.fmt)
-        event = ldEvent("testevent", "0", "testcomment", 0, None)
 
         # create a mocked header
-        head = ldHead(meta_ptr, data_ptr, event_ptr, event,
+        head = ldHead(meta_ptr, data_ptr, 0, None,
                        "testdriver",  "testvehicleid", "testvenue",
                        datetime.datetime.now(),
-                       "just a test")
+                       "just a test", "testevent", "practice")
 
         # create the channels, meta data and associated data
         channs, prev, next = [], 0, meta_ptr + chanheadsize
@@ -121,14 +119,11 @@ class ldData(object):
         """Write an ld file containing the current header information and channel data
         """
 
-        # convert the data using scale/shift etc before writing the data
-        conv_data = lambda c: ((c.data / c.mul) - c.shift) * c.scale / pow(10., -c.dec)
-
         with open(f, 'wb') as f_:
             self.head.write(f_, len(self.channs))
             f_.seek(self.channs[0].meta_ptr)
             list(map(lambda c: c[1].write(f_, c[0]), enumerate(self.channs)))
-            list(map(lambda c: f_.write(conv_data(c).astype(c.dtype)), self.channs))
+            list(map(lambda c: f_.write(c.write_data()), self.channs))
 
 
 class ldEvent(object):
@@ -249,26 +244,28 @@ class ldHead(object):
         "66x"     # ??
         "64s"     # short comment
         "126x"    # ??
+        "64s"     # event
+        "64s"     # session
     )
 
-    def __init__(self, meta_ptr, data_ptr, event_ptr, event, driver, vehicleid, venue, datetime, short_comment):
-        self.meta_ptr, self.data_ptr, self.event_ptr, self.event, self.driver, self.vehicleid, \
-        self.venue, self.datetime, self.short_comment = meta_ptr, data_ptr, event_ptr, event, \
-                                                driver, vehicleid, venue, datetime, short_comment
+    def __init__(self, meta_ptr, data_ptr, aux_ptr, aux, driver, vehicleid, venue, datetime, short_comment, event, session):
+        self.meta_ptr, self.data_ptr, self.aux_ptr, self.aux, self.driver, self.vehicleid, \
+        self.venue, self.datetime, self.short_comment, self.event, self.session = meta_ptr, data_ptr, aux_ptr, aux, \
+                                                driver, vehicleid, venue, datetime, short_comment, event, session
 
     @classmethod
     def fromfile(cls, f):
         # type: (file) -> ldHead
         """Parses and stores the header information of an ld file
         """
-        (_, meta_ptr, data_ptr, event_ptr,
+        (_, meta_ptr, data_ptr, aux_ptr,
             _, _, _,
             _, _, _, _, n,
             date, time,
             driver, vehicleid, venue,
-            _, short_comment) = struct.unpack(ldHead.fmt, f.read(struct.calcsize(ldHead.fmt)))
-        date, time, driver, vehicleid, venue, short_comment = \
-            map(decode_string, [date, time, driver, vehicleid, venue, short_comment])
+            _, short_comment, event, session) = struct.unpack(ldHead.fmt, f.read(struct.calcsize(ldHead.fmt)))
+        date, time, driver, vehicleid, venue, short_comment, event, session = \
+            map(decode_string, [date, time, driver, vehicleid, venue, short_comment, event, session])
 
         try:
             # first, try to decode datatime with seconds
@@ -278,26 +275,29 @@ class ldHead(object):
             _datetime = datetime.datetime.strptime(
                 '%s %s'%(date, time), '%d/%m/%Y %H:%M')
 
-        event = None
-        if event_ptr > 0:
-            f.seek(event_ptr)
-            event = ldEvent.fromfile(f)
-        return cls(meta_ptr, data_ptr, event_ptr, event, driver, vehicleid, venue, _datetime, short_comment)
+        aux = None
+        if aux_ptr > 0:
+            f.seek(aux_ptr)
+            aux = ldEvent.fromfile(f)
+        return cls(meta_ptr, data_ptr, aux_ptr, aux, driver, vehicleid, venue, _datetime, short_comment, event, session)
 
     def write(self, f, n):
+        channel_counts = (n << 16) | n
         f.write(struct.pack(ldHead.fmt,
                             0x40,
-                            self.meta_ptr, self.data_ptr, self.event_ptr,
-                            1, 0x4240, 0xf,
-                            0x1f44, "ADL".encode(), 420, 0xadb0, n,
+                            self.meta_ptr, self.data_ptr, self.aux_ptr,
+                            2, 0x4240, 0xf,
+                            0x8540, "M1".encode(), 100, 0x80, channel_counts,
                             self.datetime.date().strftime("%d/%m/%Y").encode(),
                             self.datetime.time().strftime("%H:%M:%S").encode(),
                             self.driver.encode(), self.vehicleid.encode(), self.venue.encode(),
-                            0xc81a4, self.short_comment.encode()
+                            0x06344004, self.short_comment.encode(), self.event.encode(), self.session.encode(),
                             ))
-        if self.event_ptr > 0:
-            f.seek(self.event_ptr)
-            self.event.write(f)
+        f.seek(0x5a)
+        f.write(struct.pack("<HH", 200, 1))
+        if self.aux_ptr > 0:
+            f.seek(self.aux_ptr)
+            self.aux.write(f)
 
     def __str__(self):
         return 'driver:    %s\n' \
@@ -305,8 +305,9 @@ class ldHead(object):
                'venue:     %s\n' \
                'event:     %s\n' \
                'session:   %s\n' \
-               'short_comment: %s'%(
-            self.driver, self.vehicleid, self.venue, self.event.name, self.event.session, self.short_comment)
+               'short_comment: %s\n' \
+               'event_long:    %s'%(
+            self.driver, self.vehicleid, self.venue, self.event, self.session, self.short_comment, self.aux)
 
 
 class ldChan(object):
@@ -321,28 +322,84 @@ class ldChan(object):
         "IIII"    # prev_addr next_addr data_ptr n_data
         "H"       # some counter?
         "HHH"     # datatype datatype rec_freq
-        "hhhh"    # shift mul scale dec_places
-        "32s"     # name
-        "8s"      # short name
-        "12s"     # unit
-        "40x"     # ? (40 bytes for ACC, 32 bytes for acti)
+        "hhhh"    # shift mul scale unknown
+        "32s"     # channel id/name
+        "8s"      # display unit
+        "8s"      # unknown
+        "12s"     # unknown
+        "f"       # display mode minimum
+        "f"       # display mode maximum
+        "B"       # decimal places
+        "B"       # sampling mode
+        "B"       # display format
+        "13x"     # padding
+        "II"      # channel metadata pointer, optional extra metadata pointer
     )
+    fixed_size = struct.calcsize(fmt)
+    default_metadata_size = 56
+    # Display-unit bytes observed in exports/S1_#34112_20260403_142112_06.ld.
+    # MoTeC i2 uses this 8-byte text field to bind a channel to its global
+    # Data Properties quantity. Unitless channels use a null display-unit field.
+    display_unit_lookup = {
+        "": "0000000000000000",
+        "%": "2500000000000000",
+        "A": "4100000000000000",
+        "A.h": "412e680000000000",
+        "C": "4300000000000000",
+        "G": "4700000000000000",
+        "Hz": "487a000000000000",
+        "N": "4e00000000000000",
+        "Pa": "5061000000000000",
+        "V": "5600000000000000",
+        "deg": "6465670000000000",
+        "deg/s": "6465672f73000000",
+        "kPa": "6b50610000000000",
+        "km": "6b6d000000000000",
+        "km/h": "6b6d2f6800000000",
+        "m": "6d00000000000000",
+        "m/s": "6d2f730000000000",
+        "m/s/s": "6d2f732f73000000",
+        "mbar": "6d62617200000000",
+        "mm": "6d6d000000000000",
+        "ms": "6d73000000000000",
+        "ohm": "6f686d0000000000",
+        "ratio": "726174696f000000",
+        "rpm": "72706d0000000000",
+        "s": "7300000000000000",
+        "us": "7573000000000000",
+    }
+    display_unit_lookup = {
+        unit: bytes.fromhex(value)
+        for unit, value in display_unit_lookup.items()
+    }
 
     def __init__(self, _f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                  dtype, freq, shift, mul, scale, dec,
-                 name, short_name, unit):
+                 name, short_name, unit, unknown=0, metadata_unknown=0, sample_mode=3,
+                 display_format=0, unit_tail=None, display_min=0.0, display_max=0.0,
+                 channel_metadata=None, extra_metadata=None):
 
         self._f = _f
         self.meta_ptr = meta_ptr
         self._data = None
 
+        if unit_tail is None:
+            unit_tail = b""
+        if extra_metadata is None:
+            extra_metadata = b""
+
         (self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
         self.dtype, self.freq,
-        self.shift, self.mul, self.scale, self.dec,
-        self.name, self.short_name, self.unit) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
+        self.shift, self.mul, self.scale, self.unknown, self.dec,
+        self.name, self.short_name, self.unit, self.unit_tail, self.display_min,
+        self.display_max, self.metadata_unknown, self.sample_mode,
+        self.display_format, self.channel_metadata,
+        self.extra_metadata) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len,\
                                                  dtype, freq,\
-                                                 shift, mul, scale, dec,\
-                                                 name, short_name, unit
+                                                 shift, mul, scale, unknown, min(int(dec), 0x30),\
+                                                 name, short_name, unit, unit_tail, display_min,\
+                                                 display_max, metadata_unknown, sample_mode,\
+                                                 display_format, channel_metadata, extra_metadata
 
     def with_sample_range(self, sample_start, sample_end):
         # type: (int, int) -> ldChan
@@ -357,7 +414,11 @@ class ldChan(object):
         chan = ldChan(self._f, self.meta_ptr, self.prev_meta_ptr, self.next_meta_ptr,
                       data_ptr, sample_end - sample_start, self.dtype, self.freq,
                       self.shift, self.mul, self.scale, self.dec,
-                      self.name, self.short_name, self.unit)
+                      self.name, self.short_name, self.unit, self.unknown,
+                      self.metadata_unknown, self.sample_mode,
+                      self.display_format, self.unit_tail, self.display_min,
+                      self.display_max, self.channel_metadata,
+                      self.extra_metadata)
 
         if self._data is not None:
             chan._data = self._data[sample_start:sample_end]
@@ -365,7 +426,7 @@ class ldChan(object):
         return chan
 
     @classmethod
-    def fromfile(cls, _f, meta_ptr):
+    def fromfile(cls, _f, meta_ptr, metadata_end=None):
         # type: (str, int) -> ldChan
         """Parses and stores the header information of an ld channel in a ld file
         """
@@ -373,8 +434,22 @@ class ldChan(object):
             f.seek(meta_ptr)
 
             (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
-             dtype_a, dtype, freq, shift, mul, scale, dec,
-             name, short_name, unit) = struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
+             dtype_a, dtype, freq, shift, mul, scale, unknown,
+             name, unit, short_name, unit_tail, display_min, display_max, dec, sample_mode, display_format,
+             channel_metadata_ptr, extra_metadata_ptr) = \
+                struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
+
+            end_ptr = next_meta_ptr if next_meta_ptr else metadata_end
+            channel_metadata = None
+            extra_metadata = b""
+            if channel_metadata_ptr:
+                channel_metadata_end = extra_metadata_ptr if extra_metadata_ptr else end_ptr
+                if channel_metadata_end and channel_metadata_end >= channel_metadata_ptr:
+                    f.seek(channel_metadata_ptr)
+                    channel_metadata = f.read(channel_metadata_end - channel_metadata_ptr)
+            if extra_metadata_ptr and end_ptr and end_ptr >= extra_metadata_ptr:
+                f.seek(extra_metadata_ptr)
+                extra_metadata = f.read(end_ptr - extra_metadata_ptr)
 
         name, short_name, unit = map(decode_string, [name, short_name, unit])
 
@@ -384,7 +459,9 @@ class ldChan(object):
             return lst[idx]
 
         if dtype_a in [0x07]:
-            dtype = safe_get([None, np.float16, None, np.float32], dtype - 1)
+            dtype = [None, np.float16, None, np.float32][dtype-1]
+        elif dtype_a == 0x06:
+            dtype = np.int32
         elif dtype_a in [0, 0x03, 0x05]:
             dtype = safe_get([None, np.int16, None, np.int32], dtype - 1)
         elif dtype_a == 0x08 and dtype == 0x08:
@@ -393,7 +470,31 @@ class ldChan(object):
             dtype = None
 
         return cls(_f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
-                   dtype, freq, shift, mul, scale, dec, name, short_name, unit)
+                   dtype, freq, shift, mul, scale, dec, name, short_name, unit,
+                   unknown, 0, sample_mode, display_format, unit_tail,
+                   display_min, display_max, channel_metadata, extra_metadata)
+
+    def metadata_size(self):
+        return self.fixed_size + len(self.get_channel_metadata()) + len(self.extra_metadata)
+
+    def get_channel_metadata(self):
+        if self.channel_metadata is not None:
+            return self.channel_metadata
+
+        metadata_ptr = self.meta_ptr + self.fixed_size
+        pointer_value = metadata_ptr + 44
+        rate_hint = max(1, int(round(self.freq * 5.0 / 6.0)))
+        return struct.pack("<HHII36xHHI", 0, self.freq, 2, pointer_value, 1, rate_hint, 0)
+
+    def get_display_unit(self):
+        unit = self.unit
+        if isinstance(unit, bytes):
+            unit = decode_string(unit)
+
+        if unit in self.display_unit_lookup:
+            return self.display_unit_lookup[unit]
+
+        return str(unit).encode()[:8].ljust(8, b"\0")
 
     def write(self, f, n):
         if self.dtype == np.float16 or self.dtype == np.float32:
@@ -403,10 +504,22 @@ class ldChan(object):
             dtype_a = 0x05 if self.dtype == np.int32 else 0x03
             dtype = {np.int16: 2, np.int32: 4}[self.dtype]
 
+        channel_metadata = self.get_channel_metadata()
+        channel_metadata_ptr = self.meta_ptr + self.fixed_size if channel_metadata else 0
+        extra_metadata_ptr = channel_metadata_ptr + len(channel_metadata) if self.extra_metadata else 0
+        display_unit = self.get_display_unit()
+
         f.write(struct.pack(ldChan.fmt,
                             self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
-                            0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.dec,
-                            self.name.encode(), self.short_name.encode(), self.unit.encode()))
+                            0x2ee1+n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.unknown,
+                            self.name.encode(), display_unit, self.short_name.encode(), self.unit_tail,
+                            self.display_min, self.display_max, min(int(self.dec), 0x30),
+                            self.sample_mode, self.display_format, channel_metadata_ptr, extra_metadata_ptr))
+        f.write(channel_metadata)
+        f.write(self.extra_metadata)
+
+    def write_data(self):
+        return np.asarray(self.data, dtype=self.dtype).tobytes()
 
     @property
     def data(self):
@@ -422,8 +535,6 @@ class ldChan(object):
                 try:
                     self._data = np.fromfile(f,
                                             count=self.data_len, dtype=self.dtype)
-
-                    self._data = (self._data/self.scale * pow(10., -self.dec) + self.shift) * self.mul
 
                     if len(self._data) != self.data_len:
                         raise ValueError("Not all data read!")
@@ -453,7 +564,7 @@ def decode_string(bytes):
         return ""
         # raise e
 
-def read_channels(f_, meta_ptr):
+def read_channels(f_, meta_ptr, metadata_end=None):
     # type: (str, int) -> list
     """ Read channel data inside ld file
 
@@ -463,7 +574,7 @@ def read_channels(f_, meta_ptr):
     """
     chans = []
     while meta_ptr:
-        chan_ = ldChan.fromfile(f_, meta_ptr)
+        chan_ = ldChan.fromfile(f_, meta_ptr, metadata_end)
         chans.append(chan_)
         meta_ptr = chan_.next_meta_ptr
     return chans
@@ -478,7 +589,7 @@ def read_ldfile(f_, laps=None, ldx_file=None):
     """
     with open(f_, 'rb') as f:
         head_ = ldHead.fromfile(f)
-    chans = read_channels(f_, head_.meta_ptr)
+    chans = read_channels(f_, head_.meta_ptr, head_.data_ptr)
 
     if laps is not None:
         if ldx_file is None:
