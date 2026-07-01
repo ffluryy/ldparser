@@ -116,7 +116,10 @@ class ldData(object):
             self.head.write(f_, len(self.channs))
             f_.seek(self.channs[0].meta_ptr)
             list(map(lambda c: c[1].write(f_, c[0]), enumerate(self.channs)))
-            list(map(lambda c: f_.write(c.write_data()), self.channs))
+            # Stream each channel's samples straight to the file with tofile(),
+            # avoiding the intermediate bytes copy that write_data() would build.
+            for c in self.channs:
+                np.asarray(c.data, dtype=c.dtype, copy=False).tofile(f_)
 
 
 class ldEvent(object):
@@ -480,7 +483,7 @@ class ldChan(object):
         f.write(self.extra_metadata)
 
     def write_data(self):
-        return np.asarray(self.data, dtype=self.dtype).tobytes()
+        return np.asarray(self.data, dtype=self.dtype, copy=False).tobytes()
 
     @property
     def data(self):
