@@ -622,6 +622,93 @@ def read_ldx_beacons(ldx_file):
     return sorted(beacons)
 
 
+def _format_ldx_time(time_us):
+    # type: (object) -> str
+    """Format a microsecond timestamp the way MoTeC writes it.
+
+    MoTeC exports .ldx Time attributes in scientific notation with 17
+    significant digits, e.g. 402218646 us -> '4.02218646000000000e+08'.
+    """
+    return '%.17e' % Decimal(int(round(time_us)))
+
+
+def _format_lap_time(seconds):
+    # type: (Decimal) -> str
+    """Format a lap duration as M:SS.sss, matching MoTeC's Details block."""
+    total_ms = int((seconds * 1000).to_integral_value(rounding=ROUND_CEILING))
+    minutes, ms = divmod(total_ms, 60000)
+    return '%d:%02d.%03d' % (minutes, ms // 1000, ms % 1000)
+
+
+def write_ldx_beacons(ldx_file, beacon_times_us):
+    # type: (str, object) -> ()
+    """Write an .ldx sidecar of BCN lap beacons.
+
+    Each entry in beacon_times_us is treated as an end-of-lap beacon timestamp
+    in microseconds since the start of the log (beacon N marks the end of lap
+    N, with lap 1 starting at log t=0). This matches the convention
+    read_ldx_beacons / get_lap_time_range consume on the way back in.
+
+    The output mirrors the structure MoTeC i2 exports: an LDXFile with a
+    Layers/Layer/MarkerBlock/MarkerGroup chain of BCN markers, an empty
+    RangeBlock, and a Details block summarizing total/fastest laps.
+    """
+    beacons = [Decimal(int(round(t))) for t in beacon_times_us]
+
+    root = ET.Element('LDXFile', {
+        'Locale': 'English_United States.1252',
+        'DefaultLocale': 'C',
+        'Version': '1.6',
+    })
+    layers = ET.SubElement(root, 'Layers')
+    layer = ET.SubElement(layers, 'Layer')
+    marker_block = ET.SubElement(layer, 'MarkerBlock')
+    marker_group = ET.SubElement(marker_block, 'MarkerGroup', {
+        'Name': 'Beacons',
+        'Index': str(len(beacons)),
+    })
+    for i, time_us in enumerate(beacons, start=1):
+        ET.SubElement(marker_group, 'Marker', {
+            'Version': '100',
+            'ClassName': 'BCN',
+            'Name': 'Manual.%d' % i,
+            'Flags': '77',
+            'Time': _format_ldx_time(time_us),
+        })
+
+    ET.SubElement(layer, 'RangeBlock')
+
+    # Details: total laps and the fastest completed lap. Lap durations come
+    # from consecutive beacon deltas (lap 1 runs from log start = 0 us).
+    details = ET.SubElement(layers, 'Details')
+    prev_us = Decimal(0)
+    fastest_lap = None
+    fastest_time = None
+    for i, time_us in enumerate(beacons, start=1):
+        lap_s = (time_us - prev_us) / Decimal(1000000)
+        if fastest_time is None or lap_s < fastest_time:
+            fastest_time = lap_s
+            fastest_lap = i
+        prev_us = time_us
+
+    ET.SubElement(details, 'String', {
+        'Id': 'Total Laps', 'Value': str(len(beacons)),
+    })
+    if fastest_lap is not None:
+        ET.SubElement(details, 'String', {
+            'Id': 'Fastest Time', 'Value': _format_lap_time(fastest_time),
+        })
+        ET.SubElement(details, 'String', {
+            'Id': 'Fastest Lap', 'Value': str(fastest_lap),
+        })
+
+    tree = ET.ElementTree(root)
+    indent = getattr(ET, 'indent', None)
+    if indent is not None:
+        indent(tree)
+    tree.write(ldx_file, encoding='utf-8', xml_declaration=True)
+
+
 def parse_lap_range(laps):
     # type: (object) -> (int, int)
     """Normalize a 1-based inclusive lap range."""
