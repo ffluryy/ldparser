@@ -108,7 +108,7 @@ class ldData(object):
         # type: (str) -> ldData
         """Parse data of an ld file
 
-        When laps is provided, only data in the selected 1-based inclusive
+        When laps is provided, only data in the selected 0-based inclusive
         lap range is read. Lap boundaries are loaded from the matching .ldx
         file by default.
         """
@@ -119,14 +119,39 @@ class ldData(object):
         """Write an ld file containing the current header information and channel data
         """
 
+        source_data_ptrs = [c.data_ptr for c in self.channs]
+        metadata_sizes = [c.metadata_size() for c in self.channs]
+
+        meta_ptr = self.head.meta_ptr
+        prev_meta_ptr = 0
+        for n, chan in enumerate(self.channs):
+            current_meta_ptr = meta_ptr
+            meta_ptr += metadata_sizes[n]
+            next_meta_ptr = meta_ptr if n < len(self.channs) - 1 else 0
+            chan.meta_ptr = current_meta_ptr
+            chan.prev_meta_ptr = prev_meta_ptr
+            chan.next_meta_ptr = next_meta_ptr
+            prev_meta_ptr = current_meta_ptr
+
+        self.head.data_ptr = meta_ptr
+        data_ptr = self.head.data_ptr
+        for chan in self.channs:
+            chan.data_ptr = data_ptr
+            data_ptr += chan.data_len * np.dtype(chan.dtype).itemsize
+
         with open(f, 'wb') as f_:
             self.head.write(f_, len(self.channs))
             f_.seek(self.channs[0].meta_ptr)
             list(map(lambda c: c[1].write(f_, c[0]), enumerate(self.channs)))
             # Stream each channel's samples straight to the file with tofile(),
             # avoiding the intermediate bytes copy that write_data() would build.
-            for c in self.channs:
+            f_.seek(self.head.data_ptr)
+            for n, c in enumerate(self.channs):
+                output_data_ptr = c.data_ptr
+                if c._data is None:
+                    c.data_ptr = source_data_ptrs[n]
                 np.asarray(c.data, dtype=c.dtype, copy=False).tofile(f_)
+                c.data_ptr = output_data_ptr
 
 
 class ldEvent(object):
@@ -500,12 +525,20 @@ class ldChan(object):
         return str(unit).encode()[:8].ljust(8, b"\0")
 
     def write(self, f, n):
-        if self.dtype == np.float16 or self.dtype == np.float32:
+        if self.dtype is None:
+            raise ValueError(f'Channel {self.name} has unknown data type')
+
+        dtype_obj = np.dtype(self.dtype)
+
+        if dtype_obj == np.dtype(np.float16) or dtype_obj == np.dtype(np.float32):
             dtype_a = 0x07
-            dtype = {np.float16: 2, np.float32: 4}[self.dtype]
+            dtype = {np.dtype(np.float16): 2, np.dtype(np.float32): 4}[dtype_obj]
+        elif dtype_obj == np.dtype(np.float64):
+            dtype_a = 0x08
+            dtype = 0x08
         else:
-            dtype_a = 0x05 if self.dtype == np.int32 else 0x03
-            dtype = {np.int16: 2, np.int32: 4}[self.dtype]
+            dtype_a = 0x05 if dtype_obj == np.dtype(np.int32) else 0x03
+            dtype = {np.dtype(np.int16): 2, np.dtype(np.int32): 4}[dtype_obj]
 
         channel_metadata = self.get_channel_metadata()
         channel_metadata_ptr = self.meta_ptr + self.fixed_size if channel_metadata else 0
@@ -578,6 +611,8 @@ def read_channels(f_, meta_ptr, metadata_end=None):
     chans = []
     while meta_ptr:
         chan_ = ldChan.fromfile(f_, meta_ptr, metadata_end)
+        if chan_.dtype is None and chan_.data_len == 0 and not chan_.name:
+            break
         chans.append(chan_)
         meta_ptr = chan_.next_meta_ptr
     return chans
@@ -588,7 +623,7 @@ def read_ldfile(f_, laps=None, ldx_file=None):
     """ Read an ld file, return header and list of channels
 
     If laps is provided, the channel data is constrained to the selected
-    1-based inclusive lap range using beacon markers from the .ldx sidecar.
+    0-based inclusive lap range using beacon markers from the .ldx sidecar.
     """
     with open(f_, 'rb') as f:
         head_ = ldHead.fromfile(f)
@@ -645,8 +680,8 @@ def write_ldx_beacons(ldx_file, beacon_times_us):
     """Write an .ldx sidecar of BCN lap beacons.
 
     Each entry in beacon_times_us is treated as an end-of-lap beacon timestamp
-    in microseconds since the start of the log (beacon N marks the end of lap
-    N, with lap 1 starting at log t=0). This matches the convention
+    in microseconds since the start of the log. The first beacon marks the end
+    of public lap 0, which starts at log t=0. This matches the convention
     read_ldx_beacons / get_lap_time_range consume on the way back in.
 
     The output mirrors the structure MoTeC i2 exports: an LDXFile with a
@@ -711,7 +746,7 @@ def write_ldx_beacons(ldx_file, beacon_times_us):
 
 def parse_lap_range(laps):
     # type: (object) -> (int, int)
-    """Normalize a 1-based inclusive lap range."""
+    """Normalize a 0-based inclusive lap range."""
     if isinstance(laps, int):
         start_lap, end_lap = laps, laps
     elif isinstance(laps, str):
@@ -728,8 +763,8 @@ def parse_lap_range(laps):
         start_lap, end_lap = laps
         start_lap, end_lap = int(start_lap), int(end_lap)
 
-    if start_lap < 1 or end_lap < start_lap:
-        raise ValueError('Lap range must be 1-based and inclusive, e.g. 3 or 3-5')
+    if start_lap < 0 or end_lap < start_lap:
+        raise ValueError('Lap range must be 0-based and inclusive, e.g. 0 or 3-5')
 
     return start_lap, end_lap
 
@@ -738,7 +773,7 @@ def get_lap_time_range(ldx_file, laps):
     # type: (str, object) -> (Decimal, Decimal)
     """Return start/end timestamps in microseconds for a lap range.
 
-    BCN1 marks the end of lap 1, BCN2 the end of lap 2, and so on. If the
+    BCN1 marks the end of lap 0, BCN2 the end of lap 1, and so on. If the
     requested range ends on the final open-ended lap, end_us is None.
     """
     start_lap, end_lap = parse_lap_range(laps)
@@ -747,8 +782,8 @@ def get_lap_time_range(ldx_file, laps):
     if not beacons:
         raise ValueError('No BCN markers found in %s' % ldx_file)
 
-    max_lap_with_boundary = len(beacons)
-    max_selectable_lap = max_lap_with_boundary + 1
+    max_lap_with_boundary = len(beacons) - 1
+    max_selectable_lap = len(beacons)
 
     if start_lap > max_selectable_lap:
         raise ValueError(
@@ -760,8 +795,8 @@ def get_lap_time_range(ldx_file, laps):
             'Lap range ends at lap %i, but %s only has boundaries through lap %i' %
             (end_lap, ldx_file, max_lap_with_boundary))
 
-    start_us = Decimal(0) if start_lap == 1 else beacons[start_lap - 2]
-    end_us = beacons[end_lap - 1] if end_lap <= max_lap_with_boundary else None
+    start_us = Decimal(0) if start_lap == 0 else beacons[start_lap - 1]
+    end_us = beacons[end_lap] if end_lap <= max_lap_with_boundary else None
 
     return start_us, end_us
 
@@ -796,7 +831,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Parse MoTec .ld files.')
     parser.add_argument('path', help='Directory containing .ld files')
     parser.add_argument('--laps',
-                        help='1-based inclusive lap or lap range to extract, e.g. 3 or 3-5')
+                        help='0-based inclusive lap or lap range to extract, e.g. 0 or 3-5')
     args = parser.parse_args()
 
     for f in glob.glob('%s/*.ld'%args.path):

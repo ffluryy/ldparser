@@ -39,7 +39,7 @@ Invoke with
 python ldparser.py /path/to/some/dir
 ```
 
-To extract only a 1-based inclusive lap range, pass `--laps`:
+To extract only a 0-based inclusive lap range, pass `--laps`:
 
 ```bash
 python ldparser.py /path/to/some/dir --laps 3-5
