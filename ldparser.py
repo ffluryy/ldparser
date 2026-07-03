@@ -593,12 +593,11 @@ def decode_string(bytes):
     # type: (bytes) -> str
     """decode the bytes and remove trailing zeros
     """
+    raw = bytes.split(b'\0', 1)[0]
     try:
-        return bytes.decode('ascii').strip().rstrip('\0').strip()
-    except Exception as e:
-        print("Could not decode string: %s - %s"%(e, bytes))
-        return ""
-        # raise e
+        return raw.decode('ascii').strip()
+    except UnicodeDecodeError:
+        return raw.decode('cp1252').strip()
 
 def read_channels(f_, meta_ptr, metadata_end=None):
     # type: (str, int) -> list
