@@ -825,7 +825,6 @@ if __name__ == '__main__':
     import argparse, glob
     from itertools import groupby
     import pandas as pd
-    import matplotlib.pyplot as plt
 
     parser = argparse.ArgumentParser(description='Parse MoTec .ld files.')
     parser.add_argument('path', help='Directory containing .ld files')
@@ -841,8 +840,7 @@ if __name__ == '__main__':
         print(list(map(str, l)))
         print()
 
-        # create plots for all channels with the same frequency
-        for f, g in groupby(l.channs, lambda x:x.freq):
-            df = pd.DataFrame({i.name.lower(): i.data for i in g})
-            df.plot()
-            plt.show()
+    print()
+    print("Done")
+    print(f"Converted: {converted}")
+    print(f"Failed:    {failed}")
