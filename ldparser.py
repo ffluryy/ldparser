@@ -4,7 +4,10 @@ Code created through reverse engineering the data format.
 """
 
 import datetime
+import os
 import struct
+import xml.etree.ElementTree as ET
+from decimal import Decimal, ROUND_CEILING
 
 import numpy as np
 
@@ -66,11 +69,11 @@ class ldData(object):
         cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
 
         # pointer to data of first channel
-        chanheadsize = struct.calcsize(ldChan.fmt)
+        chanheadsize = ldChan.fixed_size + ldChan.default_metadata_size
         data_ptr = meta_ptr + len(cols) * chanheadsize
 
         # create a mocked header
-        head = ldHead(meta_ptr, data_ptr, 0,  None,
+        head = ldHead(meta_ptr, data_ptr, 0, None,
                        "testdriver",  "testvehicleid", "testvenue",
                        datetime.datetime.now(),
                        "just a test", "testevent", "practice")
@@ -101,22 +104,54 @@ class ldData(object):
         return cls(head, channs)
 
     @classmethod
-    def fromfile(cls, f):
+    def fromfile(cls, f, laps=None, ldx_file=None):
         # type: (str) -> ldData
         """Parse data of an ld file
+
+        When laps is provided, only data in the selected 0-based inclusive
+        lap range is read. Lap boundaries are loaded from the matching .ldx
+        file by default.
         """
-        return cls(*read_ldfile(f))
+        return cls(*read_ldfile(f, laps=laps, ldx_file=ldx_file))
 
     def write(self, f):
         # type: (str) -> ()
         """Write an ld file containing the current header information and channel data
         """
 
+        source_data_ptrs = [c.data_ptr for c in self.channs]
+        metadata_sizes = [c.metadata_size() for c in self.channs]
+
+        meta_ptr = self.head.meta_ptr
+        prev_meta_ptr = 0
+        for n, chan in enumerate(self.channs):
+            current_meta_ptr = meta_ptr
+            meta_ptr += metadata_sizes[n]
+            next_meta_ptr = meta_ptr if n < len(self.channs) - 1 else 0
+            chan.meta_ptr = current_meta_ptr
+            chan.prev_meta_ptr = prev_meta_ptr
+            chan.next_meta_ptr = next_meta_ptr
+            prev_meta_ptr = current_meta_ptr
+
+        self.head.data_ptr = meta_ptr
+        data_ptr = self.head.data_ptr
+        for chan in self.channs:
+            chan.data_ptr = data_ptr
+            data_ptr += chan.data_len * np.dtype(chan.dtype).itemsize
+
         with open(f, 'wb') as f_:
             self.head.write(f_, len(self.channs))
             f_.seek(self.channs[0].meta_ptr)
             list(map(lambda c: c[1].write(f_, c[0]), enumerate(self.channs)))
-            list(map(lambda c: f_.write(c.write_data()), self.channs))
+            # Stream each channel's samples straight to the file with tofile(),
+            # avoiding the intermediate bytes copy that write_data() would build.
+            f_.seek(self.head.data_ptr)
+            for n, c in enumerate(self.channs):
+                output_data_ptr = c.data_ptr
+                if c._data is None:
+                    c.data_ptr = source_data_ptrs[n]
+                np.asarray(c.data, dtype=c.dtype, copy=False).tofile(f_)
+                c.data_ptr = output_data_ptr
 
 
 class ldEvent(object):
@@ -394,6 +429,30 @@ class ldChan(object):
                                                  display_max, metadata_unknown, sample_mode,\
                                                  display_format, channel_metadata, extra_metadata
 
+    def with_sample_range(self, sample_start, sample_end):
+        # type: (int, int) -> ldChan
+        """Return a channel that reads only the requested sample window."""
+        sample_start = min(max(int(sample_start), 0), self.data_len)
+        sample_end = min(max(int(sample_end), sample_start), self.data_len)
+        data_ptr = self.data_ptr
+
+        if self.dtype is not None:
+            data_ptr += sample_start * np.dtype(self.dtype).itemsize
+
+        chan = ldChan(self._f, self.meta_ptr, self.prev_meta_ptr, self.next_meta_ptr,
+                      data_ptr, sample_end - sample_start, self.dtype, self.freq,
+                      self.shift, self.mul, self.scale, self.dec,
+                      self.name, self.short_name, self.unit, self.unknown,
+                      self.metadata_unknown, self.sample_mode,
+                      self.display_format, self.unit_tail, self.display_min,
+                      self.display_max, self.channel_metadata,
+                      self.extra_metadata)
+
+        if self._data is not None:
+            chan._data = self._data[sample_start:sample_end]
+
+        return chan
+
     @classmethod
     def fromfile(cls, _f, meta_ptr, metadata_end=None):
         # type: (str, int) -> ldChan
@@ -422,13 +481,21 @@ class ldChan(object):
 
         name, short_name, unit = map(decode_string, [name, short_name, unit])
 
+        def safe_get(lst, idx):
+            if idx < 0 or idx >= len(lst):
+                return None
+            return lst[idx]
+
         if dtype_a in [0x07]:
             dtype = [None, np.float16, None, np.float32][dtype-1]
         elif dtype_a == 0x06:
             dtype = np.int32
         elif dtype_a in [0, 0x03, 0x05]:
-            dtype = [None, np.int16, None, np.int32][dtype-1]
-        else: raise Exception('Datatype %i not recognized'%dtype_a)
+            dtype = safe_get([None, np.int16, None, np.int32], dtype - 1)
+        elif dtype_a == 0x08 and dtype == 0x08:
+            dtype = np.dtype('<d')
+        else:
+            dtype = None
 
         return cls(_f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
                    dtype, freq, shift, mul, scale, dec, name, short_name, unit,
@@ -458,12 +525,20 @@ class ldChan(object):
         return str(unit).encode()[:8].ljust(8, b"\0")
 
     def write(self, f, n):
-        if self.dtype == np.float16 or self.dtype == np.float32:
+        if self.dtype is None:
+            raise ValueError(f'Channel {self.name} has unknown data type')
+
+        dtype_obj = np.dtype(self.dtype)
+
+        if dtype_obj == np.dtype(np.float16) or dtype_obj == np.dtype(np.float32):
             dtype_a = 0x07
-            dtype = {np.float16: 2, np.float32: 4}[self.dtype]
+            dtype = {np.dtype(np.float16): 2, np.dtype(np.float32): 4}[dtype_obj]
+        elif dtype_obj == np.dtype(np.float64):
+            dtype_a = 0x08
+            dtype = 0x08
         else:
-            dtype_a = 0x03
-            dtype = {np.int16: 2, np.int32: 4}[self.dtype]
+            dtype_a = 0x05 if dtype_obj == np.dtype(np.int32) else 0x03
+            dtype = {np.dtype(np.int16): 2, np.dtype(np.int32): 4}[dtype_obj]
 
         channel_metadata = self.get_channel_metadata()
         channel_metadata_ptr = self.meta_ptr + self.fixed_size if channel_metadata else 0
@@ -480,13 +555,15 @@ class ldChan(object):
         f.write(self.extra_metadata)
 
     def write_data(self):
-        return np.asarray(self.data, dtype=self.dtype).tobytes()
+        return np.asarray(self.data, dtype=self.dtype, copy=False).tobytes()
 
     @property
     def data(self):
         # type: () -> np.array
         """ Read the data words of the channel
         """
+        if self.dtype is None:
+            raise ValueError(f'Channel {self.name} has unknown data type')
         if self._data is None:
             # jump to data and read
             with open(self._f, 'rb') as f:
@@ -516,12 +593,11 @@ def decode_string(bytes):
     # type: (bytes) -> str
     """decode the bytes and remove trailing zeros
     """
+    raw = bytes.split(b'\0', 1)[0]
     try:
-        return bytes.decode('ascii').strip().rstrip('\0').strip()
-    except Exception as e:
-        print("Could not decode string: %s - %s"%(e, bytes))
-        return ""
-        # raise e
+        return raw.decode('ascii').strip()
+    except UnicodeDecodeError:
+        return raw.decode('cp1252').strip()
 
 def read_channels(f_, meta_ptr, metadata_end=None):
     # type: (str, int) -> list
@@ -534,79 +610,235 @@ def read_channels(f_, meta_ptr, metadata_end=None):
     chans = []
     while meta_ptr:
         chan_ = ldChan.fromfile(f_, meta_ptr, metadata_end)
+        if chan_.dtype is None and chan_.data_len == 0 and not chan_.name:
+            break
         chans.append(chan_)
         meta_ptr = chan_.next_meta_ptr
     return chans
 
 
-def read_ldfile(f_):
+def read_ldfile(f_, laps=None, ldx_file=None):
     # type: (str) -> (ldHead, list)
     """ Read an ld file, return header and list of channels
+
+    If laps is provided, the channel data is constrained to the selected
+    0-based inclusive lap range using beacon markers from the .ldx sidecar.
     """
-    head_ = ldHead.fromfile(open(f_,'rb'))
+    with open(f_, 'rb') as f:
+        head_ = ldHead.fromfile(f)
     chans = read_channels(f_, head_.meta_ptr, head_.data_ptr)
+
+    if laps is not None:
+        if ldx_file is None:
+            ldx_file = os.path.splitext(f_)[0] + '.ldx'
+        start_us, end_us = get_lap_time_range(ldx_file, laps)
+        chans = [slice_channel_to_time_range(chan, start_us, end_us) for chan in chans]
+
     return head_, chans
 
 
+def read_ldx_beacons(ldx_file):
+    # type: (str) -> list
+    """Read BCN marker timestamps from an .ldx file in microseconds."""
+    tree = ET.parse(ldx_file)
+    beacons = []
+
+    for marker in tree.iter('Marker'):
+        if marker.get('ClassName') != 'BCN':
+            continue
+
+        time = marker.get('Time')
+        if time is None:
+            continue
+
+        beacons.append(Decimal(time))
+
+    return sorted(beacons)
+
+
+def _format_ldx_time(time_us):
+    # type: (object) -> str
+    """Format a microsecond timestamp the way MoTeC writes it.
+
+    MoTeC exports .ldx Time attributes in scientific notation with 17
+    significant digits, e.g. 402218646 us -> '4.02218646000000000e+08'.
+    """
+    return '%.17e' % Decimal(int(round(time_us)))
+
+
+def _format_lap_time(seconds):
+    # type: (Decimal) -> str
+    """Format a lap duration as M:SS.sss, matching MoTeC's Details block."""
+    total_ms = int((seconds * 1000).to_integral_value(rounding=ROUND_CEILING))
+    minutes, ms = divmod(total_ms, 60000)
+    return '%d:%02d.%03d' % (minutes, ms // 1000, ms % 1000)
+
+
+def write_ldx_beacons(ldx_file, beacon_times_us):
+    # type: (str, object) -> ()
+    """Write an .ldx sidecar of BCN lap beacons.
+
+    Each entry in beacon_times_us is treated as an end-of-lap beacon timestamp
+    in microseconds since the start of the log. The first beacon marks the end
+    of public lap 0, which starts at log t=0. This matches the convention
+    read_ldx_beacons / get_lap_time_range consume on the way back in.
+
+    The output mirrors the structure MoTeC i2 exports: an LDXFile with a
+    Layers/Layer/MarkerBlock/MarkerGroup chain of BCN markers, an empty
+    RangeBlock, and a Details block summarizing total/fastest laps.
+    """
+    beacons = [Decimal(int(round(t))) for t in beacon_times_us]
+
+    root = ET.Element('LDXFile', {
+        'Locale': 'English_United States.1252',
+        'DefaultLocale': 'C',
+        'Version': '1.6',
+    })
+    layers = ET.SubElement(root, 'Layers')
+    layer = ET.SubElement(layers, 'Layer')
+    marker_block = ET.SubElement(layer, 'MarkerBlock')
+    marker_group = ET.SubElement(marker_block, 'MarkerGroup', {
+        'Name': 'Beacons',
+        'Index': str(len(beacons)),
+    })
+    for i, time_us in enumerate(beacons, start=1):
+        ET.SubElement(marker_group, 'Marker', {
+            'Version': '100',
+            'ClassName': 'BCN',
+            'Name': 'Manual.%d' % i,
+            'Flags': '77',
+            'Time': _format_ldx_time(time_us),
+        })
+
+    ET.SubElement(layer, 'RangeBlock')
+
+    # Details: total laps and the fastest completed lap. Lap durations come
+    # from consecutive beacon deltas (lap 1 runs from log start = 0 us).
+    details = ET.SubElement(layers, 'Details')
+    prev_us = Decimal(0)
+    fastest_lap = None
+    fastest_time = None
+    for i, time_us in enumerate(beacons, start=1):
+        lap_s = (time_us - prev_us) / Decimal(1000000)
+        if fastest_time is None or lap_s < fastest_time:
+            fastest_time = lap_s
+            fastest_lap = i
+        prev_us = time_us
+
+    ET.SubElement(details, 'String', {
+        'Id': 'Total Laps', 'Value': str(len(beacons)),
+    })
+    if fastest_lap is not None:
+        ET.SubElement(details, 'String', {
+            'Id': 'Fastest Time', 'Value': _format_lap_time(fastest_time),
+        })
+        ET.SubElement(details, 'String', {
+            'Id': 'Fastest Lap', 'Value': str(fastest_lap),
+        })
+
+    tree = ET.ElementTree(root)
+    indent = getattr(ET, 'indent', None)
+    if indent is not None:
+        indent(tree)
+    tree.write(ldx_file, encoding='utf-8', xml_declaration=True)
+
+
+def parse_lap_range(laps):
+    # type: (object) -> (int, int)
+    """Normalize a 0-based inclusive lap range."""
+    if isinstance(laps, int):
+        start_lap, end_lap = laps, laps
+    elif isinstance(laps, str):
+        laps = laps.strip()
+        if '-' in laps:
+            start, end = laps.split('-', 1)
+            start_lap, end_lap = int(start), int(end)
+        elif ':' in laps:
+            start, end = laps.split(':', 1)
+            start_lap, end_lap = int(start), int(end)
+        else:
+            start_lap = end_lap = int(laps)
+    else:
+        start_lap, end_lap = laps
+        start_lap, end_lap = int(start_lap), int(end_lap)
+
+    if start_lap < 0 or end_lap < start_lap:
+        raise ValueError('Lap range must be 0-based and inclusive, e.g. 0 or 3-5')
+
+    return start_lap, end_lap
+
+
+def get_lap_time_range(ldx_file, laps):
+    # type: (str, object) -> (Decimal, Decimal)
+    """Return start/end timestamps in microseconds for a lap range.
+
+    BCN1 marks the end of lap 0, BCN2 the end of lap 1, and so on. If the
+    requested range ends on the final open-ended lap, end_us is None.
+    """
+    start_lap, end_lap = parse_lap_range(laps)
+    beacons = read_ldx_beacons(ldx_file)
+
+    if not beacons:
+        raise ValueError('No BCN markers found in %s' % ldx_file)
+
+    max_lap_with_boundary = len(beacons) - 1
+    max_selectable_lap = len(beacons)
+
+    if start_lap > max_selectable_lap:
+        raise ValueError(
+            'Lap range starts at lap %i, but %s only has boundaries through lap %i' %
+            (start_lap, ldx_file, max_lap_with_boundary))
+
+    if end_lap > max_selectable_lap:
+        raise ValueError(
+            'Lap range ends at lap %i, but %s only has boundaries through lap %i' %
+            (end_lap, ldx_file, max_lap_with_boundary))
+
+    start_us = Decimal(0) if start_lap == 0 else beacons[start_lap - 1]
+    end_us = beacons[end_lap] if end_lap <= max_lap_with_boundary else None
+
+    return start_us, end_us
+
+
+def time_us_to_sample_index(time_us, freq):
+    # type: (Decimal, int) -> int
+    """Convert a microsecond timestamp to the first sample at or after it."""
+    samples = time_us * Decimal(int(freq)) / Decimal(1000000)
+    return int(samples.to_integral_value(rounding=ROUND_CEILING))
+
+
+def slice_channel_to_time_range(chan, start_us, end_us):
+    # type: (ldChan, Decimal, Decimal) -> ldChan
+    """Constrain a channel to a timestamp window."""
+    sample_start = time_us_to_sample_index(start_us, chan.freq)
+    sample_end = chan.data_len if end_us is None else time_us_to_sample_index(end_us, chan.freq)
+    return chan.with_sample_range(sample_start, sample_end)
+
+
 if __name__ == '__main__':
-    import sys
-    import os
+    """ Small test of the parser.
+    
+    Decodes all ld files in the directory. For each file, creates 
+    a plot for data with the same sample frequency.  
+    """
+
+    import argparse, glob
+    from itertools import groupby
     import pandas as pd
 
-    if len(sys.argv) != 3:
-        print(
-            "Usage: python ldparser.py <source_folder> <output_folder>"
-        )
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description='Parse MoTec .ld files.')
+    parser.add_argument('path', help='Directory containing .ld files')
+    parser.add_argument('--laps',
+                        help='0-based inclusive lap or lap range to extract, e.g. 0 or 3-5')
+    args = parser.parse_args()
 
-    source_root = os.path.abspath(sys.argv[1])
-    output_root = os.path.abspath(sys.argv[2])
+    for f in glob.glob('%s/*.ld'%args.path):
+        print(os.path.basename(f))
 
-    print(f"Source: {source_root}")
-    print(f"Output: {output_root}")
-    print()
-
-    converted = 0
-    failed = 0
-
-    for root, dirs, files in os.walk(source_root):
-        for file in files:
-
-            if not file.lower().endswith(".ld"):
-                continue
-
-            ld_file = os.path.join(root, file)
-
-            try:
-                print(f"Converting: {ld_file}")
-
-                l = ldData.fromfile(ld_file)
-
-                # Create dataframe, padding shorter channels with NaN
-                df = pd.DataFrame({
-                    chan.name: pd.Series(chan.data)
-                    for chan in l.channs
-                })
-
-                # Preserve relative folder structure
-                rel_path = os.path.relpath(ld_file, source_root)
-
-                csv_path = os.path.join(
-                    output_root,
-                    os.path.splitext(rel_path)[0] + ".csv"
-                )
-
-                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-
-                df.to_csv(csv_path, index=False)
-
-                print(f"Saved: {csv_path}")
-                converted += 1
-
-            except Exception as e:
-                print(f"Failed: {ld_file}")
-                print(e)
-                failed += 1
+        l = ldData.fromfile(f, laps=args.laps)
+        print(l.head)
+        print(list(map(str, l)))
+        print()
 
     print()
     print("Done")
