@@ -549,31 +549,66 @@ def read_ldfile(f_):
 
 
 if __name__ == '__main__':
-    """ Small test of the parser.
-    
-    Decodes all ld files in the directory. For each file, creates 
-    a plot for data with the same sample frequency.  
-    """
-
-    import sys, os, glob
-    from itertools import groupby
+    import sys
+    import os
     import pandas as pd
-    import matplotlib.pyplot as plt
 
-    if len(sys.argv)!=2:
-        print("Usage: ldparser.py /some/path/")
-        exit(1)
+    if len(sys.argv) != 3:
+        print(
+            "Usage: python ldparser.py <source_folder> <output_folder>"
+        )
+        sys.exit(1)
 
-    for f in glob.glob('%s/*.ld'%sys.argv[1]):
-        print(os.path.basename(f))
+    source_root = os.path.abspath(sys.argv[1])
+    output_root = os.path.abspath(sys.argv[2])
 
-        l = ldData.fromfile(f)
-        print(l.head)
-        print(list(map(str, l)))
-        print()
+    print(f"Source: {source_root}")
+    print(f"Output: {output_root}")
+    print()
 
-        # create plots for all channels with the same frequency
-        for f, g in groupby(l.channs, lambda x:x.freq):
-            df = pd.DataFrame({i.name.lower(): i.data for i in g})
-            df.plot()
-            plt.show()
+    converted = 0
+    failed = 0
+
+    for root, dirs, files in os.walk(source_root):
+        for file in files:
+
+            if not file.lower().endswith(".ld"):
+                continue
+
+            ld_file = os.path.join(root, file)
+
+            try:
+                print(f"Converting: {ld_file}")
+
+                l = ldData.fromfile(ld_file)
+
+                # Create dataframe, padding shorter channels with NaN
+                df = pd.DataFrame({
+                    chan.name: pd.Series(chan.data)
+                    for chan in l.channs
+                })
+
+                # Preserve relative folder structure
+                rel_path = os.path.relpath(ld_file, source_root)
+
+                csv_path = os.path.join(
+                    output_root,
+                    os.path.splitext(rel_path)[0] + ".csv"
+                )
+
+                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+                df.to_csv(csv_path, index=False)
+
+                print(f"Saved: {csv_path}")
+                converted += 1
+
+            except Exception as e:
+                print(f"Failed: {ld_file}")
+                print(e)
+                failed += 1
+
+    print()
+    print("Done")
+    print(f"Converted: {converted}")
+    print(f"Failed:    {failed}")
